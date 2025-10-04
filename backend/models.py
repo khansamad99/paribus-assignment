@@ -22,6 +22,7 @@ class ProcessedHospital(BaseModel):
     name: str
     status: str
     error_message: Optional[str] = None
+    processing_time: Optional[float] = None
 
 class BulkProcessingResult(BaseModel):
     batch_id: str

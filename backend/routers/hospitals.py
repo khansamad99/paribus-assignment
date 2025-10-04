@@ -42,7 +42,8 @@ async def process_hospital_concurrent(
                     row=row_num,
                     hospital_id=result.id,
                     name=hospital.name,
-                    status="created"
+                    status="created",
+                    processing_time=hospital_time
                 )
             else:
                 # Update progress: failed
@@ -57,7 +58,8 @@ async def process_hospital_concurrent(
                     hospital_id=None,
                     name=hospital.name,
                     status="failed",
-                    error_message="API call failed"
+                    error_message="API call failed",
+                    processing_time=hospital_time
                 )
         except Exception as e:
             hospital_time = time.time() - hospital_start
@@ -75,7 +77,8 @@ async def process_hospital_concurrent(
                 hospital_id=None,
                 name=hospital.name,
                 status="failed",
-                error_message=str(e)
+                error_message=str(e),
+                processing_time=hospital_time
             )
 
 @router.post("/bulk", response_model=BulkProcessingResult)
@@ -370,7 +373,8 @@ async def resume_bulk_processing(batch_id: str):
                 hospital_id=h.hospital_id,
                 name=h.name,
                 status=h.status,
-                error_message=h.error_message
+                error_message=h.error_message,
+                processing_time=h.processing_time
             ) for h in progress.hospitals]
         )
         
