@@ -31,6 +31,9 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 | `GET` | `/` | Root endpoint with API info |
 | `GET` | `/health` | Health check |
 | `POST` | `/hospitals/bulk` | Bulk create hospitals from CSV |
+| `POST` | `/hospitals/validate` | Validate CSV format before processing |
+| `GET` | `/hospitals/progress/{batch_id}` | Get real-time progress for batch |
+| `POST` | `/hospitals/progress/cleanup` | Clean up old progress data |
 
 ## 📄 CSV Format
 
@@ -69,13 +72,31 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
 - **Optimized Timeouts**: Separate connect (10s) and total (30s) timeouts
 - **Error Handling**: Comprehensive error handling with detailed responses
 
+### Progress Tracking
+- **Real-time Progress**: Monitor bulk processing status in real-time
+- **Hospital-level Tracking**: Individual hospital processing status and timing
+- **Progress Percentage**: Automatic progress calculation and completion status
+- **Thread-safe Operations**: Concurrent access to progress data
+
+### Enhanced Validation
+- **Pre-processing Validation**: Validate CSV before bulk processing
+- **Detailed Error Reporting**: Row-level error identification with specific messages
+- **Data Validation**: Name, address, phone number format validation
+- **File Analysis**: Encoding, size, and format verification
+
 ## 🏗️ Architecture
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────────┐
-│   CSV Upload    │───▶│  Bulk Processor  │───▶│  Hospital Directory │
-│   (FastAPI)     │    │  (Concurrent)    │    │       API           │
+│   CSV Upload    │───▶│  CSV Validator   │───▶│  Progress Tracker   │
+│   (FastAPI)     │    │  (Enhanced)      │    │  (Real-time)        │
 └─────────────────┘    └──────────────────┘    └─────────────────────┘
+                              │                           │
+                              ▼                           ▼
+                       ┌──────────────────┐    ┌─────────────────────┐
+                       │  Bulk Processor  │───▶│  Hospital Directory │
+                       │  (Concurrent)    │    │       API           │
+                       └──────────────────┘    └─────────────────────┘
                               │
                               ▼
                        ┌──────────────────┐
@@ -86,24 +107,32 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
 ### Core Components
 
 1. **CSV Processor** (`services/csv_processor.py`)
-   - Validates CSV format and data
-   - Parses hospital records
-   - Error handling for invalid data
+   - **Enhanced Validation**: Detailed validation with row-level error reporting
+   - **Data Validation**: Name (2-255 chars), address (5-500 chars), phone format
+   - **File Analysis**: Encoding detection, header validation, duplicate checking
+   - **Preview Generation**: Shows first 5 valid hospitals for verification
 
-2. **Hospital API Service** (`services/hospital_api.py`)
-   - HTTP client with connection pooling
-   - Individual hospital creation
-   - Batch activation
-   - Optimized for concurrent requests
+2. **Progress Tracker** (`services/progress_tracker.py`)
+   - **Real-time Progress**: Thread-safe in-memory progress tracking
+   - **Hospital-level Status**: Individual processing status and timing
+   - **Progress States**: initializing, validating, processing, activating, completed, failed
+   - **Automatic Cleanup**: Removes old progress data (24+ hours)
 
-3. **Bulk Router** (`routers/hospitals.py`)
-   - Concurrent processing with semaphore
-   - Performance monitoring
-   - Comprehensive error handling
+3. **Hospital API Service** (`services/hospital_api.py`)
+   - **HTTP Client Optimization**: Connection pooling (20 keepalive, 100 max)
+   - **Concurrent Support**: Optimized timeouts and connection limits
+   - **Batch Operations**: Individual hospital creation and batch activation
+   - **Error Handling**: Comprehensive error handling and retry logic
 
-## 📊 API Response
+4. **Bulk Router** (`routers/hospitals.py`)
+   - **Concurrent Processing**: Semaphore-controlled concurrent hospital creation
+   - **Progress Integration**: Real-time progress updates during processing
+   - **Enhanced Validation**: Pre-processing CSV validation endpoint
+   - **Performance Monitoring**: Detailed timing and logging
 
-Successful bulk processing returns:
+## 📊 API Responses
+
+### Bulk Processing Response
 ```json
 {
   "batch_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -123,33 +152,115 @@ Successful bulk processing returns:
 }
 ```
 
+### CSV Validation Response
+```json
+{
+  "is_valid": true,
+  "total_rows": 4,
+  "valid_rows": 4,
+  "invalid_rows": 0,
+  "errors": [],
+  "warnings": [],
+  "preview_hospitals": [
+    {
+      "name": "General Hospital",
+      "address": "123 Main Street New York NY 10001",
+      "phone": "555-0123"
+    }
+  ],
+  "file_info": {
+    "size_bytes": 265,
+    "encoding": "utf-8",
+    "delimiter": ",",
+    "has_header": true
+  }
+}
+```
+
+### Progress Tracking Response
+```json
+{
+  "batch_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "processing",
+  "total_hospitals": 4,
+  "processed_hospitals": 2,
+  "failed_hospitals": 0,
+  "progress_percentage": 50.0,
+  "processing_time_seconds": 3.2,
+  "current_step": "Processing hospitals concurrently",
+  "batch_activated": false,
+  "hospitals": [
+    {
+      "row": 1,
+      "name": "General Hospital",
+      "status": "created",
+      "hospital_id": 101,
+      "processing_time": 5.39
+    },
+    {
+      "row": 2,
+      "name": "City Medical Center",
+      "status": "processing",
+      "hospital_id": null,
+      "processing_time": null
+    }
+  ],
+  "is_completed": false
+}
+```
+
 ## 🔍 Processing Workflow
 
+### Enhanced CSV Validation (Optional)
+1. **Pre-processing Validation** via `POST /hospitals/validate`
+   - Detailed CSV format and data validation
+   - Row-level error identification and reporting
+   - Preview of valid hospitals and file analysis
+   - No data is processed or stored
+
+### Bulk Processing Workflow
 1. **Upload & Validation**
-   - Validate CSV file format
-   - Parse and validate hospital data
+   - Validate CSV file format and basic structure
+   - Parse and validate hospital data using enhanced validation
    - Generate unique batch ID (UUID)
+   - Initialize progress tracking
 
-2. **Concurrent Processing**
-   - Create semaphore for rate limiting
-   - Process hospitals concurrently (up to 10 at once)
-   - Track individual hospital processing times
+2. **Progress Tracking Setup**
+   - Create progress tracker entry with hospital names
+   - Set initial status to "initializing"
+   - Enable real-time progress monitoring
 
-3. **Batch Activation**
+3. **Concurrent Processing**
+   - Update status to "processing"
+   - Create semaphore for rate limiting (max 10 concurrent)
+   - Process hospitals concurrently with individual progress updates
+   - Track processing time for each hospital
+
+4. **Batch Activation**
+   - Update status to "activating"
    - Activate entire batch if all hospitals created successfully
    - Update hospital statuses to "created_and_activated"
 
-4. **Response Generation**
+5. **Completion & Response**
+   - Mark progress as "completed"
    - Compile comprehensive processing results
    - Include performance metrics and detailed status
+   - Maintain progress data for future queries
 
 ## 🚀 Deployment
 
 ### Local Testing
 ```bash
-# Test with sample CSV
+# Validate CSV before processing
+curl -X POST "http://localhost:8000/hospitals/validate" \
+  -F "file=@sample_hospitals.csv"
+
+# Bulk process hospitals
 curl -X POST "http://localhost:8000/hospitals/bulk" \
   -F "file=@sample_hospitals.csv"
+
+# Track progress (replace {batch_id} with actual batch ID)
+curl "http://localhost:8000/hospitals/progress/{batch_id}"
 ```
 
 ### Production (Render)
@@ -166,6 +277,8 @@ Sample CSV file included in project root: `sample_hospitals.csv`
 - **4 hospitals**: ~6 seconds (concurrent) vs ~24 seconds (sequential)
 - **20 hospitals**: ~6-7 seconds (concurrent) vs ~120 seconds (sequential)
 - **95% performance improvement** through concurrent processing
+- **Real-time Progress**: Sub-second progress updates during processing
+- **Validation Speed**: CSV validation completes in <1 second for 20 hospitals
 
 ## 🛠️ External Dependencies
 
@@ -176,7 +289,20 @@ Sample CSV file included in project root: `sample_hospitals.csv`
 
 ## 📝 Error Handling
 
-- **CSV Validation**: Missing columns, invalid data, file size limits
-- **API Errors**: Network timeouts, external API failures
-- **Concurrent Processing**: Individual hospital failures don't affect others
-- **Detailed Logging**: Per-hospital processing times and error messages
+### Enhanced CSV Validation
+- **Format Errors**: Invalid encoding, missing headers, malformed CSV
+- **Data Validation**: Name length (2-255), address length (5-500), phone format
+- **File Constraints**: Maximum 20 hospitals, UTF-8 encoding required
+- **Row-level Errors**: Specific error messages with row and column identification
+
+### Processing Errors
+- **API Failures**: Individual hospital creation failures don't stop processing
+- **Network Issues**: Connection timeouts, external API unavailability
+- **Concurrent Safety**: Thread-safe progress tracking and error reporting
+- **Batch Failures**: Partial success handling with detailed error reporting
+
+### Progress Tracking
+- **Real-time Updates**: Progress continues even if individual hospitals fail
+- **Error Persistence**: Failed hospital details stored in progress data
+- **Cleanup Handling**: Automatic cleanup of old progress data
+- **Thread Safety**: Concurrent access protection for progress updates

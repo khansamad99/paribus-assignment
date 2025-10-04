@@ -31,3 +31,41 @@ class BulkProcessingResult(BaseModel):
     processing_time_seconds: float
     batch_activated: bool
     hospitals: List[ProcessedHospital]
+
+class HospitalProgressResponse(BaseModel):
+    row: int
+    name: str
+    status: str
+    hospital_id: Optional[int] = None
+    error_message: Optional[str] = None
+    processing_time: Optional[float] = None
+
+class ProgressResponse(BaseModel):
+    batch_id: str
+    status: str
+    total_hospitals: int
+    processed_hospitals: int
+    failed_hospitals: int
+    progress_percentage: float
+    processing_time_seconds: float
+    current_step: str
+    batch_activated: bool
+    hospitals: List[HospitalProgressResponse]
+    is_completed: bool
+
+class ValidationError(BaseModel):
+    row: int
+    column: str
+    value: str
+    error_type: str
+    message: str
+
+class CSVValidationResult(BaseModel):
+    is_valid: bool
+    total_rows: int
+    valid_rows: int
+    invalid_rows: int
+    errors: List[ValidationError]
+    warnings: List[str]
+    preview_hospitals: List[HospitalCreate]
+    file_info: dict
