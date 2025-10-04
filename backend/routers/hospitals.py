@@ -3,7 +3,7 @@ import uuid
 import asyncio
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from typing import List, Tuple
-from models import BulkProcessingResult, ProcessedHospital, ProgressResponse, HospitalProgressResponse, CSVValidationResult
+from models import BulkProcessingResult, ProcessedHospital, ProgressResponse, HospitalProgressResponse, CSVValidationResult, ResumableBatch, ResumeResult
 from services.csv_processor import CSVProcessor
 from services.hospital_api import HospitalAPIService
 from services.progress_tracker import progress_tracker, ProcessingStatus
@@ -98,9 +98,19 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
     # Generate batch ID
     batch_id = str(uuid.uuid4())
     
+    # Store CSV data for potential resume operations
+    csv_data = []
+    for hospital in hospitals:
+        csv_data.append({
+            'name': hospital.name,
+            'address': hospital.address,
+            'phone': hospital.phone
+        })
+    
     # Initialize progress tracking
     hospital_names = [hospital.name for hospital in hospitals]
-    progress_tracker.create_batch_progress(batch_id, len(hospitals), hospital_names)
+    progress = progress_tracker.create_batch_progress(batch_id, len(hospitals), hospital_names)
+    progress.original_csv_data = csv_data  # Store for resume capability
     progress_tracker.update_status(batch_id, ProcessingStatus.VALIDATING, "CSV validation completed")
     
     # Initialize API service
@@ -170,8 +180,8 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
         )
         
     except Exception as e:
-        # Mark batch as failed in progress tracker
-        progress_tracker.mark_batch_failed(batch_id, str(e))
+        # Mark batch as resumable for recovery
+        progress_tracker.mark_batch_resumable(batch_id, f"Processing failed: {str(e)}", csv_data)
         raise
     finally:
         await api_service.close()
@@ -238,4 +248,156 @@ async def validate_csv(file: UploadFile = File(...)):
     validation_result = CSVProcessor.detailed_csv_validation(content)
     
     return validation_result
+
+@router.get("/resumable", response_model=List[ResumableBatch])
+async def get_resumable_batches():
+    """
+    Get all batches that can be resumed after failure
+    """
+    resumable_batches = progress_tracker.get_resumable_batches()
+    return [ResumableBatch(**batch) for batch in resumable_batches]
+
+@router.post("/resume/{batch_id}", response_model=BulkProcessingResult)
+async def resume_bulk_processing(batch_id: str):
+    """
+    Resume a failed bulk processing operation from where it left off
+    """
+    # Load the batch for resume
+    progress = progress_tracker.load_batch_for_resume(batch_id)
+    
+    if not progress:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    if not progress.is_resumable or progress.status != ProcessingStatus.RESUMABLE:
+        raise HTTPException(status_code=400, detail="Batch is not resumable")
+    
+    start_time = time.time()
+    
+    # Update status to processing
+    progress.status = ProcessingStatus.PROCESSING
+    progress.resume_count += 1
+    progress.current_step = f"Resuming processing from row {progress.resume_from_row}"
+    
+    # Initialize API service
+    api_service = HospitalAPIService()
+    
+    try:
+        # Get hospitals to process (from CSV data)
+        hospitals_to_process = []
+        for i, csv_row in enumerate(progress.original_csv_data, start=1):
+            if i >= progress.resume_from_row:
+                # Check if this hospital was already processed successfully
+                existing_hospital = next((h for h in progress.hospitals if h.row == i), None)
+                if not existing_hospital or existing_hospital.status not in ["created", "created_and_activated"]:
+                    hospitals_to_process.append((i, csv_row))
+        
+        if not hospitals_to_process:
+            # All hospitals already processed, just activate if needed
+            progress.current_step = "All hospitals already processed, checking activation"
+        else:
+            # Process remaining hospitals concurrently
+            max_concurrent_requests = min(settings.MAX_CONCURRENT_REQUESTS, len(hospitals_to_process))
+            semaphore = asyncio.Semaphore(max_concurrent_requests)
+            
+            print(f"Resuming {len(hospitals_to_process)} hospitals with {max_concurrent_requests} concurrent connections")
+            
+            # Create tasks for unprocessed hospitals
+            tasks = []
+            for row_num, csv_row in hospitals_to_process:
+                # Create hospital object from CSV data
+                from models import HospitalCreate
+                hospital = HospitalCreate(
+                    name=csv_row['name'],
+                    address=csv_row['address'],
+                    phone=csv_row.get('phone')
+                )
+                
+                tasks.append(
+                    process_hospital_concurrent(api_service, hospital, batch_id, row_num, semaphore)
+                )
+            
+            # Execute concurrent processing
+            new_results = await asyncio.gather(*tasks, return_exceptions=False)
+            
+            # Update progress with new results
+            for result in new_results:
+                # Update or add hospital progress
+                existing_idx = next((i for i, h in enumerate(progress.hospitals) if h.row == result.row), None)
+                if existing_idx is not None:
+                    progress.hospitals[existing_idx] = result
+                else:
+                    progress.hospitals.append(result)
+        
+        # Recalculate counts
+        successful_count = sum(1 for h in progress.hospitals if h.status == "created")
+        failed_count = sum(1 for h in progress.hospitals if h.status == "failed")
+        
+        # Update progress counts
+        progress.processed_hospitals = successful_count
+        progress.failed_hospitals = failed_count
+        
+        # Try to activate batch if all successful
+        batch_activated = False
+        if successful_count > 0 and failed_count == 0:
+            progress.current_step = "Activating hospital batch"
+            batch_activated = await api_service.activate_batch(batch_id)
+            
+            if batch_activated:
+                progress.batch_activated = True
+                for hospital in progress.hospitals:
+                    if hospital.status == "created":
+                        hospital.status = "created_and_activated"
+        
+        # Mark as completed or failed
+        if failed_count == 0:
+            progress_tracker.complete_batch(batch_id, batch_activated)
+        else:
+            # Still has failures, mark as resumable again
+            csv_data = progress.original_csv_data
+            progress_tracker.mark_batch_resumable(batch_id, f"Resume attempt {progress.resume_count} completed with {failed_count} failures", csv_data)
+        
+        processing_time = time.time() - start_time
+        
+        return BulkProcessingResult(
+            batch_id=batch_id,
+            total_hospitals=progress.total_hospitals,
+            processed_hospitals=successful_count,
+            failed_hospitals=failed_count,
+            processing_time_seconds=round(processing_time, 2),
+            batch_activated=batch_activated,
+            hospitals=[ProcessedHospital(
+                row=h.row,
+                hospital_id=h.hospital_id,
+                name=h.name,
+                status=h.status,
+                error_message=h.error_message
+            ) for h in progress.hospitals]
+        )
+        
+    except Exception as e:
+        # Mark batch as resumable with error
+        csv_data = progress.original_csv_data
+        progress_tracker.mark_batch_resumable(batch_id, f"Resume failed: {str(e)}", csv_data)
+        raise HTTPException(status_code=500, detail=f"Resume operation failed: {str(e)}")
+    finally:
+        await api_service.close()
+
+@router.delete("/batch/{batch_id}/abandon")
+async def abandon_batch(batch_id: str):
+    """
+    Abandon a failed batch and clean up its data
+    """
+    progress = progress_tracker.get_progress(batch_id)
+    
+    if not progress:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    # Clean up the batch
+    progress_tracker._delete_batch_from_disk(batch_id)
+    
+    with progress_tracker._lock:
+        if batch_id in progress_tracker._progress_store:
+            del progress_tracker._progress_store[batch_id]
+    
+    return {"message": f"Batch {batch_id} has been abandoned and cleaned up"}
 

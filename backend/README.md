@@ -34,6 +34,9 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 | `POST` | `/hospitals/validate` | Validate CSV format before processing |
 | `GET` | `/hospitals/progress/{batch_id}` | Get real-time progress for batch |
 | `POST` | `/hospitals/progress/cleanup` | Clean up old progress data |
+| `GET` | `/hospitals/resumable` | Get all resumable failed batches |
+| `POST` | `/hospitals/resume/{batch_id}` | Resume a failed batch from where it left off |
+| `DELETE` | `/hospitals/batch/{batch_id}/abandon` | Abandon a failed batch and clean up |
 
 ## 📄 CSV Format
 
@@ -84,6 +87,12 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
 - **Data Validation**: Name, address, phone number format validation
 - **File Analysis**: Encoding, size, and format verification
 
+### Resume Capability
+- **Fault Tolerance**: Automatic recovery from processing failures
+- **Smart Resume**: Skips already processed hospitals, continues from failure point
+- **Persistent Storage**: State saved to disk for recovery across server restarts
+- **Resume Management**: List, resume, or abandon failed batches
+
 ## 🏗️ Architecture
 
 ```
@@ -97,11 +106,18 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
                        │  Bulk Processor  │───▶│  Hospital Directory │
                        │  (Concurrent)    │    │       API           │
                        └──────────────────┘    └─────────────────────┘
-                              │
-                              ▼
-                       ┌──────────────────┐
-                       │ Batch Activation │
-                       └──────────────────┘
+                              │                           │
+                              ▼                           ▼
+                       ┌──────────────────┐    ┌─────────────────────┐
+                       │ Batch Activation │    │  Resume Manager     │
+                       └──────────────────┘    │  (Fault Recovery)   │
+                                               └─────────────────────┘
+                                                          │
+                                                          ▼
+                                               ┌─────────────────────┐
+                                               │ Persistent Storage  │
+                                               │   (batch_storage/)  │
+                                               └─────────────────────┘
 ```
 
 ### Core Components
@@ -115,7 +131,9 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
 2. **Progress Tracker** (`services/progress_tracker.py`)
    - **Real-time Progress**: Thread-safe in-memory progress tracking
    - **Hospital-level Status**: Individual processing status and timing
-   - **Progress States**: initializing, validating, processing, activating, completed, failed
+   - **Progress States**: initializing, validating, processing, activating, completed, failed, resumable
+   - **Persistent Storage**: File-based state persistence for resume capability
+   - **Resume Management**: Smart resume logic and batch recovery
    - **Automatic Cleanup**: Removes old progress data (24+ hours)
 
 3. **Hospital API Service** (`services/hospital_api.py`)
@@ -128,6 +146,7 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
    - **Concurrent Processing**: Semaphore-controlled concurrent hospital creation
    - **Progress Integration**: Real-time progress updates during processing
    - **Enhanced Validation**: Pre-processing CSV validation endpoint
+   - **Resume Capability**: Resume failed batches and abandon operations
    - **Performance Monitoring**: Detailed timing and logging
 
 ## 📊 API Responses
@@ -209,6 +228,47 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
 }
 ```
 
+### Resumable Batches Response
+```json
+[
+  {
+    "batch_id": "550e8400-e29b-41d4-a716-446655440000",
+    "total_hospitals": 5,
+    "processed_hospitals": 3,
+    "failed_hospitals": 2,
+    "resume_from_row": 4,
+    "failure_reason": "Processing failed: Connection timeout",
+    "last_checkpoint_time": 1698765432.123
+  }
+]
+```
+
+### Resume Result Response
+```json
+{
+  "batch_id": "550e8400-e29b-41d4-a716-446655440000",
+  "total_hospitals": 5,
+  "processed_hospitals": 5,
+  "failed_hospitals": 0,
+  "processing_time_seconds": 3.45,
+  "batch_activated": true,
+  "hospitals": [
+    {
+      "row": 4,
+      "hospital_id": 104,
+      "name": "Emergency Medical Center",
+      "status": "created_and_activated"
+    },
+    {
+      "row": 5,
+      "hospital_id": 105,
+      "name": "Pediatric Hospital",
+      "status": "created_and_activated"
+    }
+  ]
+}
+```
+
 ## 🔍 Processing Workflow
 
 ### Enhanced CSV Validation (Optional)
@@ -247,6 +307,28 @@ MAX_CSV_SIZE = 20                  # Maximum hospitals per CSV
    - Include performance metrics and detailed status
    - Maintain progress data for future queries
 
+### Resume Capability Workflow
+1. **Failure Detection**
+   - Automatic failure detection during processing
+   - Mark batch as "resumable" with failure reason
+   - Save progress state to persistent storage
+
+2. **Resume Discovery**
+   - List all resumable batches via `GET /hospitals/resumable`
+   - View batch details including failure point and reason
+   - Check progress and determine resume strategy
+
+3. **Smart Resume Processing**
+   - Resume from exact failure point using `POST /hospitals/resume/{batch_id}`
+   - Skip already successfully processed hospitals
+   - Continue with remaining unprocessed hospitals
+   - Maintain all previous progress and timing data
+
+4. **Recovery Completion**
+   - Activate batch if all hospitals successfully processed
+   - Update final status and completion metrics
+   - Clean up resumable state upon success
+
 ## 🚀 Deployment
 
 ### Local Testing
@@ -261,6 +343,16 @@ curl -X POST "http://localhost:8000/hospitals/bulk" \
 
 # Track progress (replace {batch_id} with actual batch ID)
 curl "http://localhost:8000/hospitals/progress/{batch_id}"
+
+# Resume capability commands
+# List all resumable failed batches
+curl "http://localhost:8000/hospitals/resumable"
+
+# Resume a specific failed batch
+curl -X POST "http://localhost:8000/hospitals/resume/{batch_id}"
+
+# Abandon a failed batch and clean up
+curl -X DELETE "http://localhost:8000/hospitals/batch/{batch_id}/abandon"
 ```
 
 ### Production (Render)
@@ -320,9 +412,11 @@ Sample CSV file included in project root: `sample_hospitals.csv`
 - **Network Issues**: Connection timeouts, external API unavailability
 - **Concurrent Safety**: Thread-safe progress tracking and error reporting
 - **Batch Failures**: Partial success handling with detailed error reporting
+- **Resume Capability**: Automatic failure detection and resumable batch creation
 
 ### Progress Tracking
 - **Real-time Updates**: Progress continues even if individual hospitals fail
 - **Error Persistence**: Failed hospital details stored in progress data
+- **Resume State Management**: Persistent storage for resumable batches
 - **Cleanup Handling**: Automatic cleanup of old progress data
 - **Thread Safety**: Concurrent access protection for progress updates

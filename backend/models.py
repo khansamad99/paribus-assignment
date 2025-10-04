@@ -69,3 +69,19 @@ class CSVValidationResult(BaseModel):
     warnings: List[str]
     preview_hospitals: List[HospitalCreate]
     file_info: dict
+
+class ResumableBatch(BaseModel):
+    batch_id: str
+    total_hospitals: int
+    processed_hospitals: int
+    failed_hospitals: int
+    resume_from_row: int
+    failure_reason: Optional[str]
+    last_checkpoint_time: Optional[float]
+
+class ResumeResult(BaseModel):
+    batch_id: str
+    resume_count: int
+    remaining_hospitals: int
+    skipped_hospitals: int
+    message: str

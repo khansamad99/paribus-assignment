@@ -1,8 +1,11 @@
 import time
-from typing import Dict, List, Optional
+import json
+import os
+from typing import Dict, List, Optional, Any
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from threading import Lock
+from pathlib import Path
 
 class ProcessingStatus(str, Enum):
     INITIALIZING = "initializing"
@@ -11,6 +14,8 @@ class ProcessingStatus(str, Enum):
     ACTIVATING = "activating"
     COMPLETED = "completed"
     FAILED = "failed"
+    PAUSED = "paused"
+    RESUMABLE = "resumable"
 
 @dataclass
 class HospitalProgress:
@@ -34,6 +39,14 @@ class BatchProgress:
     current_step: str = "Starting processing..."
     batch_activated: bool = False
     
+    # Resume capability fields
+    is_resumable: bool = False
+    resume_from_row: int = 0
+    original_csv_data: List[Dict[str, Any]] = field(default_factory=list)
+    failure_reason: Optional[str] = None
+    resume_count: int = 0
+    last_checkpoint_time: Optional[float] = None
+    
     @property
     def processing_time_seconds(self) -> float:
         if self.completion_time:
@@ -50,6 +63,8 @@ class ProgressTracker:
     def __init__(self):
         self._progress_store: Dict[str, BatchProgress] = {}
         self._lock = Lock()
+        self._storage_dir = Path("batch_storage")
+        self._storage_dir.mkdir(exist_ok=True)
     
     def create_batch_progress(self, batch_id: str, total_hospitals: int, hospital_names: List[str]) -> BatchProgress:
         """Initialize progress tracking for a new batch"""
@@ -136,6 +151,130 @@ class ProgressTracker:
         with self._lock:
             return self._progress_store.get(batch_id)
     
+    def _save_batch_to_disk(self, batch_progress: BatchProgress):
+        """Save batch progress to disk for persistence"""
+        try:
+            file_path = self._storage_dir / f"{batch_progress.batch_id}.json"
+            
+            # Convert dataclass to dict for JSON serialization
+            data = asdict(batch_progress)
+            
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=2)
+                
+        except Exception as e:
+            print(f"Warning: Failed to save batch to disk: {e}")
+    
+    def _load_batch_from_disk(self, batch_id: str) -> Optional[BatchProgress]:
+        """Load batch progress from disk"""
+        try:
+            file_path = self._storage_dir / f"{batch_id}.json"
+            
+            if not file_path.exists():
+                return None
+                
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            
+            # Convert back to dataclass
+            hospitals = [HospitalProgress(**h) for h in data.get('hospitals', [])]
+            data['hospitals'] = hospitals
+            data['status'] = ProcessingStatus(data['status'])
+            
+            return BatchProgress(**data)
+            
+        except Exception as e:
+            print(f"Warning: Failed to load batch from disk: {e}")
+            return None
+    
+    def _delete_batch_from_disk(self, batch_id: str):
+        """Delete batch file from disk"""
+        try:
+            file_path = self._storage_dir / f"{batch_id}.json"
+            if file_path.exists():
+                file_path.unlink()
+        except Exception as e:
+            print(f"Warning: Failed to delete batch file: {e}")
+    
+    def mark_batch_resumable(self, batch_id: str, failure_reason: str, csv_data: List[Dict]):
+        """Mark a batch as resumable after failure"""
+        with self._lock:
+            if batch_id in self._progress_store:
+                progress = self._progress_store[batch_id]
+                progress.status = ProcessingStatus.RESUMABLE
+                progress.is_resumable = True
+                progress.failure_reason = failure_reason
+                progress.original_csv_data = csv_data
+                progress.last_checkpoint_time = time.time()
+                
+                # Find the next row to resume from
+                completed_rows = [h.row for h in progress.hospitals if h.status in ["created", "created_and_activated"]]
+                progress.resume_from_row = max(completed_rows, default=0) + 1 if completed_rows else 1
+                
+                # Save to disk
+                self._save_batch_to_disk(progress)
+    
+    def get_resumable_batches(self) -> List[Dict]:
+        """Get all resumable batches"""
+        resumable = []
+        
+        # Check in-memory store
+        with self._lock:
+            for progress in self._progress_store.values():
+                if progress.is_resumable and progress.status == ProcessingStatus.RESUMABLE:
+                    resumable.append({
+                        "batch_id": progress.batch_id,
+                        "total_hospitals": progress.total_hospitals,
+                        "processed_hospitals": progress.processed_hospitals,
+                        "failed_hospitals": progress.failed_hospitals,
+                        "resume_from_row": progress.resume_from_row,
+                        "failure_reason": progress.failure_reason,
+                        "last_checkpoint_time": progress.last_checkpoint_time
+                    })
+        
+        # Check disk storage for batches not in memory
+        try:
+            for file_path in self._storage_dir.glob("*.json"):
+                batch_id = file_path.stem
+                if batch_id not in self._progress_store:
+                    progress = self._load_batch_from_disk(batch_id)
+                    if progress and progress.is_resumable and progress.status == ProcessingStatus.RESUMABLE:
+                        resumable.append({
+                            "batch_id": progress.batch_id,
+                            "total_hospitals": progress.total_hospitals,
+                            "processed_hospitals": progress.processed_hospitals,
+                            "failed_hospitals": progress.failed_hospitals,
+                            "resume_from_row": progress.resume_from_row,
+                            "failure_reason": progress.failure_reason,
+                            "last_checkpoint_time": progress.last_checkpoint_time
+                        })
+        except Exception as e:
+            print(f"Warning: Error reading resumable batches from disk: {e}")
+        
+        return resumable
+    
+    def load_batch_for_resume(self, batch_id: str) -> Optional[BatchProgress]:
+        """Load a batch for resume operation"""
+        with self._lock:
+            # Check in-memory first
+            if batch_id in self._progress_store:
+                return self._progress_store[batch_id]
+            
+            # Load from disk
+            progress = self._load_batch_from_disk(batch_id)
+            if progress:
+                self._progress_store[batch_id] = progress
+            
+            return progress
+    
+    def save_checkpoint(self, batch_id: str):
+        """Save a checkpoint for the batch"""
+        with self._lock:
+            if batch_id in self._progress_store:
+                progress = self._progress_store[batch_id]
+                progress.last_checkpoint_time = time.time()
+                self._save_batch_to_disk(progress)
+
     def cleanup_old_batches(self, max_age_hours: int = None):
         """Remove old batch progress data"""
         from config import settings
@@ -153,6 +292,7 @@ class ProgressTracker:
             
             for batch_id in expired_batches:
                 del self._progress_store[batch_id]
+                self._delete_batch_from_disk(batch_id)
             
             return len(expired_batches)
 

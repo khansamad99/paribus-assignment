@@ -49,3 +49,6 @@ htmlcov/
 
 # Render
 .render/
+
+# Batch Storage (runtime data)
+batch_storage/
