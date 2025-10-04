@@ -9,4 +9,9 @@ class Settings:
     CSV_REQUIRED_COLUMNS = ["name", "address"]
     CSV_OPTIONAL_COLUMNS = ["phone"]
     
+    # Performance optimization settings
+    MAX_CONCURRENT_REQUESTS = 10
+    HTTP_TIMEOUT_SECONDS = 30
+    HTTP_CONNECT_TIMEOUT_SECONDS = 10
+    
 settings = Settings()

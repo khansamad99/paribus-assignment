@@ -6,7 +6,16 @@ from models import HospitalCreate, HospitalResponse
 class HospitalAPIService:
     def __init__(self):
         self.base_url = settings.HOSPITAL_API_BASE_URL
-        self.client = httpx.AsyncClient(timeout=30.0)
+        # Optimize client for concurrent requests
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        timeout = httpx.Timeout(
+            settings.HTTP_TIMEOUT_SECONDS, 
+            connect=settings.HTTP_CONNECT_TIMEOUT_SECONDS
+        )
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=limits
+        )
     
     async def create_hospital(self, hospital: HospitalCreate, batch_id: str) -> Optional[HospitalResponse]:
         """Create a single hospital via the external API"""
