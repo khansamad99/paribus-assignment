@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  hospital-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hospital-bulk-processor
+    ports:
+      - "8000:8000"
+    environment:
+      # Application settings
+      - APP_NAME=Hospital Bulk Processing API
+      - APP_VERSION=1.0.0
+      - DEBUG_MODE=false
+      
+      # External API configuration
+      - HOSPITAL_API_BASE_URL=https://hospital-directory.onrender.com
+      
+      # CSV processing settings
+      - MAX_CSV_SIZE=20
+      
+      # Performance settings
+      - MAX_CONCURRENT_REQUESTS=10
+      - HTTP_TIMEOUT_SECONDS=30
+      - HTTP_CONNECT_TIMEOUT_SECONDS=10
+      
+      # Progress tracking
+      - PROGRESS_CLEANUP_HOURS=24
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

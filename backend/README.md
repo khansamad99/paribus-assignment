@@ -269,6 +269,26 @@ curl "http://localhost:8000/hospitals/progress/{batch_id}"
 - Build command: `pip install -r requirements.txt`
 - Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 
+### Docker Deployment
+```bash
+# Build and run with Docker Compose
+docker-compose up --build
+
+# Run in background
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop services
+docker-compose down
+```
+
+**Docker Access:**
+- Application: http://localhost:8000
+- API Documentation: http://localhost:8000/docs
+- Health Check: http://localhost:8000/health
+
 ## 🧪 Testing
 
 Sample CSV file included in project root: `sample_hospitals.csv`
