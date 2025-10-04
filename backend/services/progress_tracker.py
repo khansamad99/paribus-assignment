@@ -136,8 +136,12 @@ class ProgressTracker:
         with self._lock:
             return self._progress_store.get(batch_id)
     
-    def cleanup_old_batches(self, max_age_hours: int = 24):
+    def cleanup_old_batches(self, max_age_hours: int = None):
         """Remove old batch progress data"""
+        from config import settings
+        if max_age_hours is None:
+            max_age_hours = settings.PROGRESS_CLEANUP_HOURS
+            
         current_time = time.time()
         max_age_seconds = max_age_hours * 3600
         
